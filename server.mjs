@@ -27,27 +27,31 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 const LANGUAGE_LABELS = { en: 'English', es: 'Spanish', hi: 'Hindi' };
+const DEFAULT_AGENT_NAME = 'Ava';
 
+// Agent name is admin-configurable (Admin Settings > AI Care Agent, app_state kind:'settings'
+// id:'ai_agent') and arrives here as a ConversationRelay customParameter set by ai-call-initiate, so
+// every greeting/prompt below takes it as a parameter rather than hardcoding a name.
 const GREETINGS = {
   en: {
-    sos: (name) => `Hello, this is Follow-up's automated care line. We received an SOS alert from ${name}. Is now an okay time to talk?`,
-    message: (name) => `Hello, this is Follow-up's automated care line. We received your message to your care team, ${name}. Is now an okay time to talk?`,
+    sos: (name, agentName) => `Hello, this is ${agentName} from Follow-up's automated care line. We received an SOS alert from ${name}. Is now an okay time to talk?`,
+    message: (name, agentName) => `Hello, this is ${agentName} from Follow-up's automated care line. We received your message to your care team, ${name}. Is now an okay time to talk?`,
   },
   es: {
-    sos: (name) => `Hola, soy la línea de atención automática de Follow-up. Recibimos una alerta de SOS de ${name}. ¿Es un buen momento para hablar?`,
-    message: (name) => `Hola, soy la línea de atención automática de Follow-up. Recibimos su mensaje para su equipo de atención, ${name}. ¿Es un buen momento para hablar?`,
+    sos: (name, agentName) => `Hola, soy ${agentName}, de la línea de atención automática de Follow-up. Recibimos una alerta de SOS de ${name}. ¿Es un buen momento para hablar?`,
+    message: (name, agentName) => `Hola, soy ${agentName}, de la línea de atención automática de Follow-up. Recibimos su mensaje para su equipo de atención, ${name}. ¿Es un buen momento para hablar?`,
   },
   hi: {
-    sos: (name) => `नमस्ते, मैं Follow-up की स्वचालित केयर लाइन बोल रहा/रही हूं। हमें ${name} की ओर से एक SOS अलर्ट मिला है। क्या अभी बात करने का सही समय है?`,
-    message: (name) => `नमस्ते, मैं Follow-up की स्वचालित केयर लाइन बोल रहा/रही हूं। हमें ${name} का आपकी केयर टीम को भेजा संदेश मिला है। क्या अभी बात करने का सही समय है?`,
+    sos: (name, agentName) => `नमस्ते, मैं ${agentName} बोल रहा/रही हूं, Follow-up की स्वचालित केयर लाइन से। हमें ${name} की ओर से एक SOS अलर्ट मिला है। क्या अभी बात करने का सही समय है?`,
+    message: (name, agentName) => `नमस्ते, मैं ${agentName} बोल रहा/रही हूं, Follow-up की स्वचालित केयर लाइन से। हमें ${name} का आपकी केयर टीम को भेजा संदेश मिला है। क्या अभी बात करने का सही समय है?`,
   },
 };
 
-function systemPrompt({ trigger, language, patientName, triggerNote }) {
+function systemPrompt({ trigger, language, patientName, triggerNote, agentName }) {
   const langLabel = LANGUAGE_LABELS[language] ?? 'English';
   const base = trigger === 'sos'
-    ? `You are an automated healthcare triage phone agent for "Follow-up". You are calling ${patientName} because they triggered an SOS alert. Ask what's happening, assess severity (breathing trouble, pain radiating to arm/jaw, chest tightness), and if anything sounds serious, tell them you're alerting their care team immediately and a provider will call within minutes. Stay calm, warm, and concise -- this is a phone call, so keep each turn to 1-3 short sentences.`
-    : `You are an automated healthcare triage phone agent for "Follow-up". You are calling ${patientName} to follow up on a message they sent their care team${triggerNote ? `: "${triggerNote}"` : ''}. Ask what's going on, gauge severity, and either reassure/log it for routine follow-up or escalate if it sounds urgent. Keep each turn to 1-3 short sentences -- this is a phone call.`;
+    ? `You are ${agentName}, an automated healthcare triage phone agent for "Follow-up". You are calling ${patientName} because they triggered an SOS alert. Ask what's happening, assess severity (breathing trouble, pain radiating to arm/jaw, chest tightness), and if anything sounds serious, tell them you're alerting their care team immediately and a provider will call within minutes. Stay calm, warm, and concise -- this is a phone call, so keep each turn to 1-3 short sentences. If asked your name, say ${agentName}.`
+    : `You are ${agentName}, an automated healthcare triage phone agent for "Follow-up". You are calling ${patientName} to follow up on a message they sent their care team${triggerNote ? `: "${triggerNote}"` : ''}. Ask what's going on, gauge severity, and either reassure/log it for routine follow-up or escalate if it sounds urgent. Keep each turn to 1-3 short sentences -- this is a phone call. If asked your name, say ${agentName}.`;
   const language_instr = `Respond only in ${langLabel}.`;
   const endInstr = `When the conversation has reached a natural close (patient has nothing more to add, or you've delivered your closing line), end your final message with the exact token [END_CALL] on its own -- it will be stripped before being spoken.`;
   const testModeInstr = TEST_MODE
@@ -91,7 +95,7 @@ const server = createServer((req, res) => {
 const wss = new WebSocketServer({ server, path: '/relay' });
 
 wss.on('connection', (ws) => {
-  let ctx = null; // { sessionId, patientId, patientName, trigger, triggerNote, language, callSid }
+  let ctx = null; // { sessionId, patientId, patientName, trigger, triggerNote, language, agentName, callSid }
   let claudeHistory = []; // [{role:'user'|'assistant', content:string}]
   let transcript = []; // [{speaker:'agent'|'patient', text}]
 
@@ -108,12 +112,13 @@ wss.on('connection', (ws) => {
         trigger: p.trigger ?? 'message',
         triggerNote: p.triggerNote ?? '',
         language: p.language && LANGUAGE_LABELS[p.language] ? p.language : 'en',
+        agentName: (p.agentName ?? '').trim() || DEFAULT_AGENT_NAME,
         callSid: msg.callSid,
       };
       console.log('setup', ctx);
 
       const greetingFn = (GREETINGS[ctx.language] ?? GREETINGS.en)[ctx.trigger === 'sos' ? 'sos' : 'message'];
-      const greeting = greetingFn(ctx.patientName);
+      const greeting = greetingFn(ctx.patientName, ctx.agentName);
       transcript.push({ speaker: 'agent', text: greeting });
       claudeHistory.push({ role: 'assistant', content: greeting });
       ws.send(JSON.stringify({ type: 'text', token: greeting, last: true }));
